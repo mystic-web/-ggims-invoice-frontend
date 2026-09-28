@@ -21,9 +21,11 @@ export default function Dashboard({ token, user, onLogout, api }) {
   const [editRefund,  setEditRefund]  = useState("");
   const [drag,        setDrag]        = useState(false);
   const [lastUploaded, setLastUploaded] = useState(null);
+  const [report,      setReport]       = useState(null);
   const [syncing,     setSyncing]      = useState(false);
   const [syncMsg,     setSyncMsg]      = useState("");
   const fileRef = useRef();
+  const uploadingRef = useRef(false);
 
   const headers = { Authorization: `Bearer ${token}` };
 
@@ -48,29 +50,84 @@ export default function Dashboard({ token, user, onLogout, api }) {
   useEffect(() => { fetchInvoices(); }, [fetchInvoices]);
   useEffect(() => { fetchStats(); }, []);
 
-  const uploadFiles = async (files) => {
-    const arr = Array.from(files).filter(f => f.type === "application/pdf");
-    if (!arr.length) return;
-    setUploading(true);
-    let added = 0, skipped = 0, errors = 0;
-    for (const file of arr) {
-      setUploadMsg(`Uploading ${file.name}...`);
-      const form = new FormData();
-      form.append("pdf", file);
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const isPdf = (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name);
+
+  // Upload one file. Retries on network errors / server busy (Render free tier can be slow to wake up).
+  const uploadOne = async (file) => {
+    let lastErr = "";
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const res = await fetch(`${api}/invoices/upload`, { method: "POST", headers, body: form });
-        const data = await res.json();
-        if (res.ok) { added++; setLastUploaded(data); }
-        else if (res.status === 409) skipped++;
-        else { errors++; console.error(data.error); }
-      } catch { errors++; }
+        const form = new FormData();
+        form.append("pdf", file);
+        const res = await fetch(`${api}/invoices/upload`, {
+          method: "POST",
+          headers: { ...headers, Accept: "application/json" },
+          body: form,
+        });
+        let data = null;
+        try { data = await res.json(); } catch { data = null; }
+
+        if (res.ok) return { status: "added", invoice: data };
+        if (res.status === 409) return { status: "duplicate", detail: data?.error || "Duplicate invoice" };
+        if (res.status === 401) return { status: "failed", detail: "Session expired — please log in again" };
+
+        if ([429, 502, 503, 504].includes(res.status) || (res.status >= 500 && !data)) {
+          lastErr = `Server busy / timed out (${res.status})`;
+          await sleep(attempt * 3000);
+          continue;
+        }
+        return { status: "failed", detail: data?.error || data?.message || `Server error ${res.status}` };
+      } catch {
+        lastErr = "Network error / server not reachable";
+        await sleep(attempt * 3000);
+      }
     }
+    return { status: "failed", detail: `${lastErr} (tried 3 times)` };
+  };
+
+  const uploadFiles = async (fileList) => {
+    const all = Array.from(fileList || []);
+    if (!all.length) return;
+    if (uploadingRef.current) { showToast("An upload is already running — please wait", "error"); return; }
+    uploadingRef.current = true;
+    const pdfs   = all.filter(isPdf);
+    const nonPdf = all.filter(f => !isPdf(f));
+
+    setUploading(true);
+    setReport(null);
+    const rows = nonPdf.map(f => ({ name: f.name, status: "failed", detail: "Not a PDF file (skipped)" }));
+    let added = 0, duplicate = 0, failed = nonPdf.length;
+
+    for (let i = 0; i < pdfs.length; i++) {
+      const file = pdfs[i];
+      setUploadMsg(`Uploading ${i + 1} of ${pdfs.length}: ${file.name}`);
+      const r = await uploadOne(file);
+      if (r.status === "added") { added++; setLastUploaded(r.invoice); }
+      else if (r.status === "duplicate") { duplicate++; rows.push({ name: file.name, status: "duplicate", detail: r.detail }); }
+      else { failed++; rows.push({ name: file.name, status: "failed", detail: r.detail }); }
+    }
+
+    uploadingRef.current = false;
     setUploading(false);
     setUploadMsg("");
     fetchInvoices();
     fetchStats();
-    const msg = `${added} added${skipped ? `, ${skipped} duplicate` : ""}${errors ? `, ${errors} failed` : ""}`;
-    showToast(msg, added > 0 ? "success" : "error");
+    setReport({ total: all.length, added, duplicate, failed, rows });
+    const msg = `${added} added${duplicate ? `, ${duplicate} duplicate` : ""}${failed ? `, ${failed} failed` : ""} (of ${all.length})`;
+    showToast(msg, failed === 0 && added > 0 ? "success" : "error");
+  };
+
+  const downloadReport = () => {
+    if (!report) return;
+    const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const lines = ["File,Status,Reason", ...report.rows.map(r => [r.name, r.status, r.detail].map(esc).join(","))];
+    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "upload-report.csv";
+    a.click();
+    URL.revokeObjectURL(a.href);
   };
 
   const syncFromEmail = async () => {
@@ -231,7 +288,7 @@ export default function Dashboard({ token, user, onLogout, api }) {
         <div
           onDragOver={e => { e.preventDefault(); setDrag(true); }}
           onDragLeave={() => setDrag(false)}
-          onDrop={e => { e.preventDefault(); setDrag(false); uploadFiles(e.dataTransfer.files); }}
+          onDrop={e => { e.preventDefault(); setDrag(false); uploadFiles(Array.from(e.dataTransfer.files)); }}
           onClick={() => fileRef.current.click()}
           style={{
             border: `2px dashed ${drag ? "#1d4ed8" : "#cbd5e1"}`,
@@ -240,7 +297,7 @@ export default function Dashboard({ token, user, onLogout, api }) {
             background: drag ? "#eff6ff" : "#fff",
             transition: "all 0.15s"
           }}>
-          <input ref={fileRef} type="file" accept=".pdf" multiple style={{ display: "none" }} onChange={e => uploadFiles(e.target.files)} />
+          <input ref={fileRef} type="file" accept=".pdf" multiple style={{ display: "none" }} onChange={e => { const picked = Array.from(e.target.files); e.target.value = ""; uploadFiles(picked); }} />
           {uploading ? (
             <div style={{ color: "#1d4ed8", fontSize: 14 }}>⏳ {uploadMsg}</div>
           ) : (
@@ -251,6 +308,60 @@ export default function Dashboard({ token, user, onLogout, api }) {
             </>
           )}
         </div>
+
+        {/* Upload report — stays on screen until dismissed so nothing is lost silently */}
+        {report && (
+          <div style={{ background: "#fff", borderRadius: 10, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "14px 16px", marginBottom: 16,
+                        border: `1px solid ${report.failed ? "#fecaca" : report.duplicate ? "#fde68a" : "#bbf7d0"}` }}>
+            <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: "6px 16px" }}>
+              <strong style={{ fontSize: 14, color: "#334155" }}>Upload report</strong>
+              <span style={{ fontSize: 13, color: "#475569" }}>{report.total} file{report.total === 1 ? "" : "s"} selected</span>
+              <span style={{ fontSize: 13, color: "#16a34a", fontWeight: 600 }}>✅ {report.added} added</span>
+              <span style={{ fontSize: 13, color: "#b45309", fontWeight: 600 }}>🔁 {report.duplicate} duplicate</span>
+              <span style={{ fontSize: 13, color: "#dc2626", fontWeight: 600 }}>⚠️ {report.failed} failed</span>
+              <span style={{ fontSize: 12, color: "#94a3b8" }}>
+                (accounted: {report.added + report.duplicate + report.failed}/{report.total})
+              </span>
+              <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                {report.rows.length > 0 && (
+                  <button onClick={downloadReport}
+                    style={{ border: "1px solid #e2e8f0", background: "#f8fafc", borderRadius: 6, padding: "4px 10px", fontSize: 12, cursor: "pointer" }}>
+                    ⬇ Download list
+                  </button>
+                )}
+                <button onClick={() => setReport(null)}
+                  style={{ border: "none", background: "transparent", fontSize: 16, cursor: "pointer", color: "#64748b" }}>✕</button>
+              </span>
+            </div>
+
+            {report.rows.length === 0 ? (
+              <div style={{ fontSize: 13, color: "#16a34a", marginTop: 8 }}>All files were added successfully.</div>
+            ) : (
+              <div style={{ marginTop: 10, maxHeight: 220, overflowY: "auto", border: "1px solid #f1f5f9", borderRadius: 8 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+                  <thead>
+                    <tr style={{ background: "#f8fafc", position: "sticky", top: 0 }}>
+                      <th style={{ textAlign: "left", padding: "6px 10px", color: "#64748b" }}>File</th>
+                      <th style={{ textAlign: "left", padding: "6px 10px", color: "#64748b" }}>Status</th>
+                      <th style={{ textAlign: "left", padding: "6px 10px", color: "#64748b" }}>Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.rows.map((r, i) => (
+                      <tr key={i} style={{ borderTop: "1px solid #f1f5f9" }}>
+                        <td style={{ padding: "6px 10px", color: "#334155" }}>{r.name}</td>
+                        <td style={{ padding: "6px 10px", fontWeight: 600, color: r.status === "duplicate" ? "#b45309" : "#dc2626" }}>
+                          {r.status === "duplicate" ? "Duplicate" : "Failed"}
+                        </td>
+                        <td style={{ padding: "6px 10px", color: "#475569" }}>{r.detail}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Filters */}
         <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
